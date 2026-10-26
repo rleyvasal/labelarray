@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.1 — 2026-10-26
+
+- Grouped float32 sums and means over many small groups are much faster:
+  200,000 values in 96,846 groups (voxels holding one to a few points) now
+  take 6 ms instead of 111. The exact mean of a few float32 values often
+  lies exactly halfway between two float32 values, where the error bound
+  cannot decide the rounding; about one group in ten went to an exact
+  path computed in Python fractions. Groups whose values span a narrow
+  range of exponents now have their exact sums computed as 64-bit integers
+  and rounded with NumPy (integer division kept to 27 or 28 bits with the
+  last bit set when anything is left over, then one rounding to float32),
+  so the Python path is left for groups spanning a wide range. Results are
+  unchanged, bit for bit: the tests compare them with exact rational
+  arithmetic, and the new code gave the same bits as 0.1.0 on two million
+  results.
+
 ## 0.1.0 — 2026-10-25
 
 The first release on its own. labelarray was developed as the array layer

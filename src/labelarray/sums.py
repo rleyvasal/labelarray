@@ -214,7 +214,14 @@ def _certify(total, magnitude, terms, counts, op, compensated):
 
 
 def _exact(values, rows, chosen, groups, op, na_rm) -> np.ndarray:
-    """Correctly rounded results for groups *chosen*, from exact sums of their values."""
+    """Correctly rounded results for groups *chosen*, from exact sums of their values.
+
+    Most such groups are small and hold values of nearby magnitudes (their
+    exact mean lies on a float32 tie, where the bound cannot decide): their
+    exact sums fit in 64-bit integers and are rounded with NumPy
+    (``_rounded``). Groups spanning a wider range of exponents are summed and
+    rounded in Python integers and fractions.
+    """
     if rows is None:
         part, codes, count = values, np.zeros(len(values), dtype=np.intp), 1
     else:
@@ -223,27 +230,35 @@ def _exact(values, rows, chosen, groups, op, na_rm) -> np.ndarray:
         codes = remap[rows]
         keep = codes >= 0
         part, codes, count = values[keep], codes[keep], len(chosen)
-    totals, present, special = _exact_sums(part, codes, count, na_rm)
-    out = np.empty(count, dtype=np.float32)
-    for k in range(count):
-        if special[k] is not None:
-            out[k] = special[k]
-        elif op == "sum":
-            out[k] = _round32(totals[k])
-        else:
-            out[k] = _round32(totals[k] / present[k]) if present[k] else np.float32(np.nan)
+    buckets, low, present, nan, plus, minus = _exact_sums(part, codes, count)
+    out = np.full(count, np.nan, dtype=np.float32)
+    undefined = (nan & (not na_rm)) | (plus & minus)
+    infinite = (plus | minus) & ~undefined
+    out[infinite] = np.where(plus[infinite], np.float32(np.inf), np.float32(-np.inf))
+    regular = ~(undefined | infinite)
     if op == "mean":
-        out[(present == 0) & np.array([s is None for s in special])] = np.nan
+        regular &= present > 0  # a mean of no values stays NaN
+    divisor = present if op == "mean" else np.ones(count, dtype=np.int64)
+    whole, fits = _whole(buckets)
+    fast = regular & fits & (divisor < 2**35)  # so the integer quotient below stays within int64
+    if fast.any():
+        out[fast] = _rounded(whole[fast], low - 150, divisor[fast])
+    for k in np.flatnonzero(regular & ~fits):
+        row = buckets[k]
+        total = sum(int(row[j]) << int(j) for j in np.flatnonzero(row)) * Fraction(2) ** (low - 150)
+        out[k] = _round32(total / int(divisor[k]))
     return out
 
 
-def _exact_sums(values, codes, count, na_rm):
-    """Exact sums as Fractions, values present, and NaN or infinity where they decide the result.
+def _exact_sums(values, codes, count):
+    """Exact sums as integer buckets per group and exponent, the lowest exponent, values present, and specials.
 
     A float32 is M * 2**(e - 150) with M a signed integer below 2**24 and e
     from 1 to 254. Integers M with the same e add exactly in float64 for
     fewer than 2**29 values, so they are summed per group and exponent with
-    ``np.bincount``, and the few totals per group combined in Python integers.
+    ``np.bincount``: group k's exact sum is the sum over j of
+    ``buckets[k, j] * 2**(low + j - 150)``. Also, per group, the values
+    present (not NaN), and whether a NaN, +inf, or -inf is among them.
     """
     bits = values.view(np.uint32)
     exponent = ((bits >> 23) & 0xFF).astype(np.intp)
@@ -257,30 +272,70 @@ def _exact_sums(values, codes, count, na_rm):
     has_nan = np.bincount(codes, weights=nan, minlength=count) > 0
     plus = np.bincount(codes, weights=values == np.inf, minlength=count) > 0
     minus = np.bincount(codes, weights=values == -np.inf, minlength=count) > 0
-    totals = [Fraction(0)] * count
+    low, width = 1, 1
     if finite.any():
         low, high = int(exponent[finite].min()), int(exponent[finite].max())
         width = high - low + 1
+    buckets = np.zeros(count * width, dtype=np.int64)
+    if finite.any():
         key = codes[finite] * width + (exponent[finite] - low)
         weights = mantissa[finite].astype(np.float64)
-        buckets = np.zeros(count * width, dtype=np.int64)
         chunk = 1 << 28  # each bucket sum stays below 2**52, so float64 holds it exactly
         for start in range(0, len(key), chunk):
             buckets += np.bincount(key[start:start + chunk], weights=weights[start:start + chunk],
                                    minlength=count * width).astype(np.int64)
-        buckets = buckets.reshape(count, width)
-        scale = Fraction(2) ** (low - 150)
-        for k in range(count):
-            row = buckets[k]
-            whole = sum(int(row[j]) << int(j) for j in np.flatnonzero(row))  # Python integers: shifts beyond 63
-            totals[k] = whole * scale
-    special = [None] * count
-    for k in range(count):
-        if (has_nan[k] and not na_rm) or (plus[k] and minus[k]):
-            special[k] = np.float32(np.nan)
-        elif plus[k] or minus[k]:
-            special[k] = np.float32(np.inf if plus[k] else -np.inf)
-    return totals, present, special
+    return buckets.reshape(count, width), low, present, has_nan, plus, minus
+
+
+def _whole(buckets: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Each group's exact sum as one integer (the buckets shifted into place), and where it is below 2**52.
+
+    Where it is, the shifted buckets and their sum stay within int64 and the
+    sum is exact in float64 too; other groups need Python integers.
+    """
+    shifts = np.arange(buckets.shape[1])
+    bound = (np.abs(buckets).astype(np.float64) * np.ldexp(1.0, shifts)).sum(axis=1)  # exact terms; rounding is small
+    fits = bound < 2.0**52
+    whole = np.zeros(len(buckets), dtype=np.int64)
+    if fits.any():
+        # Shifts of zero buckets beyond 62 bits are clamped; a nonzero bucket that far up does not fit.
+        whole[fits] = np.left_shift(buckets[fits], np.minimum(shifts, 62)).sum(axis=1)
+    return whole, fits
+
+
+def _rounded(whole: np.ndarray, scale: int, divisor: np.ndarray) -> np.ndarray:
+    """``whole * 2**scale / divisor`` correctly rounded to float32, ties to even, for |whole| below 2**52.
+
+    The quotient is taken in integers to 27 or 28 significant bits, with its
+    last bit set when anything was left over ("round to odd"); with at least
+    two bits more than float32 keeps, the one rounding from float64 to
+    float32 then rounds as the exact quotient would, subnormals included.
+    """
+    sign = np.where(whole < 0, -1.0, 1.0)
+    size = np.abs(whole)
+    divisor = divisor.astype(np.int64)
+    zero = size == 0
+    size = np.where(zero, 1, size)  # placeholders; zero sums are +0.0, as NumPy gives them
+    size_bits = np.frexp(size.astype(np.float64))[1].astype(np.int64)  # bit lengths, exact below 2**53
+    divisor_bits = np.frexp(divisor.astype(np.float64))[1].astype(np.int64)
+    up = 27 + divisor_bits - size_bits  # shift so the quotient has 27 or 28 bits
+    quotient = np.empty(len(size), dtype=np.int64)
+    rest = np.empty(len(size), dtype=bool)
+    left = up >= 0
+    if left.any():  # size << up has 27 or 28 more bits than the divisor: below 2**63 for divisors below 2**35
+        numerator = np.left_shift(size[left], up[left])
+        quotient[left], remainder = np.divmod(numerator, divisor[left])
+        rest[left] = remainder != 0
+    right = ~left
+    if right.any():
+        whole_part, remainder = np.divmod(size[right], divisor[right])
+        down = -up[right]
+        quotient[right] = np.right_shift(whole_part, down)
+        rest[right] = (remainder != 0) | ((whole_part & ((np.int64(1) << down) - 1)) != 0)
+    quotient |= rest.astype(np.int64)
+    result = np.ldexp(sign * quotient.astype(np.float64), scale - up).astype(np.float32)
+    result[zero] = np.float32(0.0)
+    return result
 
 
 def _round32(value: Fraction) -> np.float32:

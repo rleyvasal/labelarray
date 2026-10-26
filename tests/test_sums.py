@@ -61,9 +61,14 @@ def expected(values: np.ndarray, op: str, na_rm: bool) -> np.float32:
 
 
 def same_bits(a, b) -> bool:
-    a, b = np.asarray(a, F32), np.asarray(b, F32)
+    return not differing(a, b).size
+
+
+def differing(a, b) -> np.ndarray:
+    """Where *a* and *b* differ in their bits, NaN counting as equal to NaN."""
+    a, b = np.atleast_1d(np.asarray(a, F32)), np.atleast_1d(np.asarray(b, F32))
     both_nan = np.isnan(a) & np.isnan(b)
-    return bool(np.all(both_nan | (a.view(np.uint32) == b.view(np.uint32))))
+    return np.flatnonzero(~(both_nan | (a.view(np.uint32) == b.view(np.uint32))))
 
 
 def corpus():
@@ -233,3 +238,84 @@ def test_compiled_kernels_run_only_from_a_size_where_they_pay(monkeypatch):
     sums.reduce(many, "sum", (0,))
     sums.reduce(many[0, :sums.COMPILED_FROM], "mean", (0,), codes=rng.integers(0, 5, sums.COMPILED_FROM), groups=5)
     assert calls == ["in_order", "grouped_estimate"]
+
+
+# ── Many tiny groups, where exact means and sums often lie on float32 ties ──
+
+
+def tiny_groups(seed, count=3000, spread=(0.0, 2.4)):
+    """Groups of 1 to 4 float32 values, many of whose exact sums and means are float32 ties."""
+    rng = np.random.default_rng(seed)
+    sizes = rng.integers(1, 5, count)
+    keys = np.repeat(np.arange(count), sizes)
+    values = rng.uniform(0, 255, len(keys)) * 10.0 ** rng.uniform(*spread, len(keys)) * rng.choice([-1, 1], len(keys))
+    values = values.astype(F32)
+    order = rng.permutation(len(values))
+    return values[order], keys[order]
+
+
+def _reduced(values, keys, count, op, na_rm=False, min_count=None):
+    return sums.reduce(values[:, None], op, (0,), codes=keys, groups=count, na_rm=na_rm, min_count=min_count)[:, 0]
+
+
+@pytest.mark.parametrize("seed", range(6))
+@pytest.mark.parametrize("op", ["sum", "mean"])
+def test_tiny_groups_on_ties_are_correctly_rounded(seed, op):
+    values, keys = tiny_groups(seed)
+    count = int(keys.max()) + 1
+    got = _reduced(values, keys, count, op)
+    groups = [values[keys == k] for k in range(count)]
+    want = np.array([expected(g, op, False) for g in groups], F32)
+    wrong = differing(got, want)
+    assert not wrong.size, [(k, groups[k], got[k], want[k]) for k in wrong[:5]]
+
+
+@pytest.mark.parametrize("na_rm", [False, True])
+def test_tiny_groups_with_subnormals_zeros_and_missing_values(na_rm):
+    rng = np.random.default_rng(7)
+    groups = []
+    for _ in range(2000):
+        size = int(rng.integers(1, 5))
+        kind = rng.integers(0, 6)
+        if kind == 0:
+            group = rng.integers(-2**23, 2**23, size) * 2.0**-149  # subnormals, and ties between them
+        elif kind == 1:
+            group = rng.choice([0.0, -0.0], size)
+        elif kind == 2:
+            group = np.where(rng.random(size) < 0.4, np.nan, rng.uniform(0, 255, size))
+        elif kind == 3:
+            group = rng.uniform(1, 2, size) * rng.choice([1, 2**-126, 2**100], size)  # narrow and wide spreads
+        elif kind == 4:
+            group = rng.choice([np.inf, -np.inf, 1.0], size)
+        else:
+            group = rng.uniform(0, 255, size)
+        groups.append(np.asarray(group, F32))
+    values = np.concatenate(groups)
+    keys = np.repeat(np.arange(len(groups)), [len(g) for g in groups])
+    for op in ("sum", "mean"):
+        got = _reduced(values, keys, len(groups), op, na_rm=na_rm)
+        want = np.array([expected(g, op, na_rm) for g in groups], F32)
+        wrong = differing(got, want)
+        assert not wrong.size, [(op, k, groups[k], got[k], want[k]) for k in wrong[:5]]
+
+
+def test_narrow_groups_are_decided_without_fractions(monkeypatch):
+    values, keys = tiny_groups(11, count=5000)
+    count = int(keys.max()) + 1
+    monkeypatch.setattr(sums, "_round32", lambda value: pytest.fail("a narrow group was decided with fractions"))
+    for op in ("sum", "mean"):
+        _reduced(values, keys, count, op)
+
+
+def test_groups_spanning_wide_exponents_still_add_exactly(monkeypatch):
+    big = 2.0**100
+    groups = [[big, 1.0, -big], [1e30, 3.0, -1e30, 1.0], [2.0**-140, 2.0**120, -(2.0**120)]]
+    values = np.concatenate([np.asarray(g, F32) for g in groups])
+    keys = np.repeat(np.arange(len(groups)), [len(g) for g in groups])
+    calls = []
+    original = sums._round32
+    monkeypatch.setattr(sums, "_round32", lambda value: calls.append(value) or original(value))
+    for op in ("sum", "mean"):
+        got = _reduced(values, keys, len(groups), op)
+        assert same_bits(got, np.array([expected(np.asarray(g, F32), op, False) for g in groups], F32))
+    assert calls  # these need the exact path in Python integers
