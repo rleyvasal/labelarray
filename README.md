@@ -14,11 +14,13 @@ It is deliberately small. What it offers that other array libraries do not:
 2. **Reproducible reductions.** Float32 sums and means are correctly
    rounded: the float32 nearest the exact result, the same in any memory
    layout. Grouped reductions are bit-identical to reducing each group on
-   its own.
+   its own, and data held in chunks (Dask) gets the same bits whatever the
+   chunking: each chunk's estimate combines in any order, and exact sums
+   settle the few results an error bound cannot.
 3. **Collections.** Arrays sharing axes, with one label array per axis,
    joined and aligned under those rules.
 
-**Status:** version `0.1.1`; the API may still
+**Status:** version `0.1.2`; the API may still
 change before 1.0. What changed in each release is in
 [CHANGELOG.md](CHANGELOG.md).
 

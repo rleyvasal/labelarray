@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.2 — 2026-10-26
+
+- Float32 sums and means of data held in chunks (Dask) can be correctly
+  rounded too, the same bits as `sums.reduce` gives in memory whatever the
+  chunking. `sums.chunk_estimate` gives one chunk's float64 totals, sums of
+  magnitudes, counts (values, values present, +inf, -inf), and the term count
+  of its error bound, which combine across chunks in any order; `settle`
+  certifies the combined estimate; `chunk_exact` gives one chunk's exact
+  sums for the groups the bound could not settle, as int64 buckets per
+  float32 exponent, which add across chunks; `exact_results` rounds them;
+  `from_chunks` drives it all given a function returning the exact sums.
+  Chunks take the NumPy estimate, since they already run in parallel.
+- Exact sums are measured from each group's own lowest nonzero exponent, so
+  a group whose values span few exponents fits in 64-bit integers whatever
+  its magnitude; a group like `[2**100, 1, -2**100]` no longer goes through
+  Python fractions. Results are unchanged, bit for bit.
+
 ## 0.1.1 — 2026-10-26
 
 - Grouped float32 sums and means over many small groups are much faster:

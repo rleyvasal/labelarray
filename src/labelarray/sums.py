@@ -19,6 +19,15 @@ Two ways, chosen by how many values each result adds:
   a bound cannot decide), so cancellation among those few values is rounded
   in float64 as it goes: ``[2**53, 1, -2**53]`` sums to 0 here, not 1.
 
+Data held in chunks (Dask) gets the same bits as data in memory, whatever the
+chunking: ``chunk_estimate`` gives each chunk's float64 totals, sums of
+magnitudes, counts, and the term count of its error bound, which combine
+across chunks in any order; ``settle`` certifies the combined estimate;
+``chunk_exact`` gives each chunk's exact sums, as integer buckets per
+exponent, for the groups the bound could not settle, which add across chunks;
+and ``from_chunks`` drives the two passes. A correctly rounded result is
+unique, so these give the bits ``reduce`` gives.
+
 Missing values: without ``na_rm`` a NaN makes its result NaN; with it, NaN
 is skipped and a mean divides by the values present. +inf and -inf together
 give NaN. A sum of no values is +0.0 and a mean NaN; a zero sum is +0.0, as
@@ -79,15 +88,25 @@ def reduce(values: np.ndarray, op: str, axes: Sequence[int], *, na_rm: bool = Fa
                     result = np.where(present >= min_count, result, np.float32(np.nan))
                 return result.reshape(kept_shape)
             return _in_order(values, axes, kept_shape, op, na_rm, min_count)
-        table = np.transpose(values, axes + kept).reshape(positions, math.prod(kept_shape))
+        table, rows, others = _table(values, axes, kept, codes)
         if codes is not None:
-            others = math.prod(values.shape[a] for a in axes[1:])
-            rows = np.asarray(codes) if others == 1 else np.repeat(np.asarray(codes), others)
             if sizes is not None and others != 1:
                 sizes = np.asarray(sizes) * others
             result = _settled(table, rows, groups, sizes, op, na_rm, min_count)
             return result.reshape((groups, *kept_shape))
         return _settled(table, None, 1, None, op, na_rm, min_count).reshape(kept_shape)
+
+
+def _table(values, axes, kept, codes):
+    """*values* as (positions along *axes*, positions along *kept*), each position's group code, and positions per code."""
+    positions = math.prod(values.shape[a] for a in axes)
+    width = math.prod(values.shape[a] for a in kept)
+    table = np.transpose(values, axes + kept).reshape(positions, width)
+    if codes is None:
+        return table, None, 1
+    others = math.prod(values.shape[a] for a in axes[1:])
+    rows = np.asarray(codes) if others == 1 else np.repeat(np.asarray(codes), others)
+    return table, rows, others
 
 
 def _in_order(values, axes, kept_shape, op, na_rm, min_count) -> np.ndarray:
@@ -138,7 +157,7 @@ def _settled(table, rows, groups, sizes, op, na_rm, min_count) -> np.ndarray:
     return result
 
 
-def _estimate(table, rows, groups, sizes, na_rm):
+def _estimate(table, rows, groups, sizes, na_rm, compiled=True):
     """Float64 sums, sums of magnitudes, values present, values, and terms for the bound, per group and column.
 
     The NumPy path adds chunks of positions (one ``np.bincount`` over
@@ -164,7 +183,7 @@ def _estimate(table, rows, groups, sizes, na_rm):
     if sizes is None:
         sizes = np.bincount(rows, minlength=groups)
     sizes = np.asarray(sizes)
-    kernel = _compiled("grouped_estimate") if COMPILED and table.size >= COMPILED_FROM else None
+    kernel = _compiled("grouped_estimate") if compiled and COMPILED and table.size >= COMPILED_FROM else None
     if kernel is not None:
         total, magnitude, present = kernel(table, np.ascontiguousarray(rows, dtype=np.intp), groups, na_rm)
         values = np.repeat(sizes[:, None], width, axis=1)
@@ -231,6 +250,12 @@ def _exact(values, rows, chosen, groups, op, na_rm) -> np.ndarray:
         keep = codes >= 0
         part, codes, count = values[keep], codes[keep], len(chosen)
     buckets, low, present, nan, plus, minus = _exact_sums(part, codes, count)
+    return _exact_finish(buckets, low, present, nan, plus, minus, op, na_rm)
+
+
+def _exact_finish(buckets, low, present, nan, plus, minus, op, na_rm) -> np.ndarray:
+    """Correctly rounded results from exact sums: *buckets* ``(count, width)`` per group and exponent from *low*."""
+    count = len(buckets)
     out = np.full(count, np.nan, dtype=np.float32)
     undefined = (nan & (not na_rm)) | (plus & minus)
     infinite = (plus | minus) & ~undefined
@@ -239,10 +264,10 @@ def _exact(values, rows, chosen, groups, op, na_rm) -> np.ndarray:
     if op == "mean":
         regular &= present > 0  # a mean of no values stays NaN
     divisor = present if op == "mean" else np.ones(count, dtype=np.int64)
-    whole, fits = _whole(buckets)
+    whole, first, fits = _whole(buckets)
     fast = regular & fits & (divisor < 2**35)  # so the integer quotient below stays within int64
     if fast.any():
-        out[fast] = _rounded(whole[fast], low - 150, divisor[fast])
+        out[fast] = _rounded(whole[fast], low + first[fast] - 150, divisor[fast])
     for k in np.flatnonzero(regular & ~fits):
         row = buckets[k]
         total = sum(int(row[j]) << int(j) for j in np.flatnonzero(row)) * Fraction(2) ** (low - 150)
@@ -287,23 +312,30 @@ def _exact_sums(values, codes, count):
     return buckets.reshape(count, width), low, present, has_nan, plus, minus
 
 
-def _whole(buckets: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Each group's exact sum as one integer (the buckets shifted into place), and where it is below 2**52.
+def _whole(buckets: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Each group's exact sum as one integer, in units of its lowest nonzero bucket; that bucket; where the integer is below 2**52.
 
     Where it is, the shifted buckets and their sum stay within int64 and the
-    sum is exact in float64 too; other groups need Python integers.
+    sum is exact in float64 too; other groups need Python integers. Measured
+    from each group's own lowest bucket, a group of any magnitude fits when
+    its values span few exponents.
     """
-    shifts = np.arange(buckets.shape[1])
-    bound = (np.abs(buckets).astype(np.float64) * np.ldexp(1.0, shifts)).sum(axis=1)  # exact terms; rounding is small
+    count, width = buckets.shape
+    nonzero = buckets != 0
+    first = np.where(nonzero.any(axis=1), nonzero.argmax(axis=1), 0)
+    place = first[:, None] + np.arange(width)
+    aligned = np.where(place < width, np.take_along_axis(buckets, np.minimum(place, width - 1), axis=1), 0)
+    shifts = np.arange(width)
+    bound = (np.abs(aligned).astype(np.float64) * np.ldexp(1.0, shifts)).sum(axis=1)  # exact terms; rounding is small
     fits = bound < 2.0**52
-    whole = np.zeros(len(buckets), dtype=np.int64)
+    whole = np.zeros(count, dtype=np.int64)
     if fits.any():
         # Shifts of zero buckets beyond 62 bits are clamped; a nonzero bucket that far up does not fit.
-        whole[fits] = np.left_shift(buckets[fits], np.minimum(shifts, 62)).sum(axis=1)
-    return whole, fits
+        whole[fits] = np.left_shift(aligned[fits], np.minimum(shifts, 62)).sum(axis=1)
+    return whole, first, fits
 
 
-def _rounded(whole: np.ndarray, scale: int, divisor: np.ndarray) -> np.ndarray:
+def _rounded(whole: np.ndarray, scale, divisor: np.ndarray) -> np.ndarray:
     """``whole * 2**scale / divisor`` correctly rounded to float32, ties to even, for |whole| below 2**52.
 
     The quotient is taken in integers to 27 or 28 significant bits, with its
@@ -353,6 +385,151 @@ def _round32(value: Fraction) -> np.float32:
         if gap < best_gap or (gap == best_gap and int(candidate.view(np.uint32)) % 2 == 0):
             best = candidate
     return np.float32(best)
+
+
+# ── Chunked data: pieces that combine in any order ──────────────────────────
+
+PIECES = 7
+TOTAL, MAGNITUDE, PRESENT, VALUES, PLUS, MINUS, TERMS = range(PIECES)
+BUCKETS = 254 + 4  # one per float32 exponent, then values present, NaN, +inf, and -inf
+EXACT_PAIRS = 1 << 14  # (group, column) pairs per exact pass: 33 MB of buckets per chunk
+
+
+def chunk_estimate(values: np.ndarray, axes: Sequence[int], *, na_rm: bool = False,
+                   codes: np.ndarray | None = None, groups: int = 0) -> np.ndarray:
+    """One chunk's estimate of its float32 sums over *axes*: ``(PIECES, groups, *kept)`` in float64.
+
+    The pieces, per group (one without *codes*) and kept position: the
+    float64 total, the sum of magnitudes, the values present (not NaN), the
+    values, the +inf and the -inf among them, and the term count of the
+    total's error bound. Chunks combine in any order: every piece adds,
+    except ``TERMS``, whose maximum is taken (``settle`` adds the number of
+    chunks to it: Higham's lemma 3.3, where a float64 sum of totals each
+    within gamma(n_i) of exact is within gamma(max n_i + k) of exact). The
+    integers stay exact in float64 below 2**53 values. The NumPy path
+    estimates every chunk: chunks run in parallel already, and the compiled
+    kernel's own threads cannot be entered from several at once.
+    """
+    values = np.asarray(values)
+    if values.dtype != np.float32:
+        raise TypeError(f"float32 values expected, got {values.dtype}")
+    axes = tuple(int(a) for a in axes)
+    kept = tuple(a for a in range(values.ndim) if a not in axes)
+    kept_shape = tuple(values.shape[a] for a in kept)
+    count = groups if codes is not None else 1
+    with np.errstate(all="ignore"):
+        table, rows, _ = _table(values, axes, kept, codes)
+        total, magnitude, present, counted, terms, _ = _estimate(table, rows, count, None, na_rm, compiled=False)
+        width = table.shape[1]
+        plus = np.zeros((count, width))
+        minus = np.zeros((count, width))
+        if np.isinf(table).any():
+            key = ((np.zeros(len(table), dtype=np.intp) if rows is None else rows)[:, None] * width
+                   + np.arange(width)).ravel()
+            plus = np.bincount(key, weights=(table == np.inf).ravel(), minlength=count * width).reshape(count, width)
+            minus = np.bincount(key, weights=(table == -np.inf).ravel(), minlength=count * width).reshape(count, width)
+    pieces = np.stack([total, magnitude, present, counted, plus, minus, terms]).astype(np.float64)
+    return pieces.reshape((PIECES, count, *kept_shape))
+
+
+def settle(pieces: np.ndarray, chunks: int, op: str, na_rm: bool) -> tuple[np.ndarray, np.ndarray]:
+    """Results the combined *pieces* of *chunks* chunks settle, and where they do not: ``(result, unsure)``.
+
+    Where the error bound proves the rounding, the result is the correctly
+    rounded one; NaN, +inf and -inf follow the missing-value rules from the
+    counts; a mean of no values is NaN. The rest, ``unsure``, need exact sums.
+    """
+    with np.errstate(all="ignore"):
+        total, magnitude, present, counted, plus, minus, terms = pieces
+        counts = present if na_rm else counted
+        result, sure = _certify(total, magnitude, terms + chunks, counts, op, False)
+        undefined = ((counted - present > 0) & (not na_rm)) | ((plus > 0) & (minus > 0))
+        infinite = ((plus > 0) | (minus > 0)) & ~undefined
+        result[undefined] = np.nan
+        result[infinite] = np.where(plus[infinite] > 0, np.float32(np.inf), np.float32(-np.inf))
+        sure |= undefined | infinite
+        if op == "mean":
+            empty = (counts == 0) & ~undefined
+            result[empty] = np.nan
+            sure |= empty
+    return result, ~sure
+
+
+def chunk_exact(values: np.ndarray, axes: Sequence[int], chosen: Sequence[int], *,
+                codes: np.ndarray | None = None, groups: int = 0) -> np.ndarray:
+    """One chunk's exact sums over *axes* for the groups *chosen*: ``(len(chosen), *kept, BUCKETS)`` in int64.
+
+    Per chosen group and kept position: the exact sum as integer buckets, one
+    per float32 exponent (``_exact_sums``), then the values present and the
+    NaN, +inf and -inf among them. Chunks add. Without *codes*, *chosen* is
+    ``[0]``. A bucket stays within int64 below 2**39 values of one exponent.
+    """
+    values = np.asarray(values)
+    if values.dtype != np.float32:
+        raise TypeError(f"float32 values expected, got {values.dtype}")
+    axes = tuple(int(a) for a in axes)
+    kept = tuple(a for a in range(values.ndim) if a not in axes)
+    kept_shape = tuple(values.shape[a] for a in kept)
+    chosen = np.asarray(chosen, dtype=np.intp)
+    count = len(chosen)
+    with np.errstate(all="ignore"):
+        table, rows, _ = _table(values, axes, kept, codes)
+        positions, width = table.shape
+        if rows is None:
+            part, pair_codes = table, np.zeros(positions, dtype=np.intp)
+        else:
+            remap = np.full(max(groups, 1), -1, dtype=np.intp)
+            remap[chosen] = np.arange(count)
+            pair_codes = remap[rows]
+            keep = pair_codes >= 0
+            part, pair_codes = table[keep], pair_codes[keep]
+        pairs = (pair_codes[:, None] * width + np.arange(width)).ravel()
+        buckets, low, present, nan, plus, minus = _exact_sums(np.ascontiguousarray(part).ravel(), pairs, count * width)
+        out = np.zeros((count * width, BUCKETS), dtype=np.int64)
+        out[:, low - 1:low - 1 + buckets.shape[1]] = buckets
+        out[:, 254] = present
+        out[:, 255] = nan
+        out[:, 256] = plus
+        out[:, 257] = minus
+    return out.reshape((count, *kept_shape, BUCKETS))
+
+
+def exact_results(buckets: np.ndarray, op: str, na_rm: bool) -> np.ndarray:
+    """Correctly rounded results from exact sums added across chunks: ``(..., BUCKETS)`` in, float32 out."""
+    buckets = np.asarray(buckets)
+    shape = buckets.shape[:-1]
+    flat = buckets.reshape(-1, BUCKETS)
+    with np.errstate(all="ignore"):
+        out = _exact_finish(flat[:, :254], 1, flat[:, 254], flat[:, 255] > 0, flat[:, 256] > 0, flat[:, 257] > 0,
+                            op, na_rm)
+    return out.reshape(shape)
+
+
+def from_chunks(pieces: np.ndarray, chunks: int, op: str, exact, *, na_rm: bool = False,
+                min_count: int | None = None) -> np.ndarray:
+    """*op* from the combined *pieces* of *chunks* chunks, with exact sums where the bound cannot settle a result.
+
+    *exact(chosen)* returns the chunks' exact sums for the groups *chosen*
+    (``chunk_exact``, added across chunks); it is called once per batch of
+    ``EXACT_PAIRS`` (group, kept position) pairs, and not at all where the
+    bound settles everything. The result is ``(groups, *kept)`` in float32,
+    the same bits as ``reduce`` gives in memory.
+    """
+    pieces = np.asarray(pieces, dtype=np.float64)
+    result, unsure = settle(pieces, chunks, op, na_rm)
+    count = len(result)
+    width = result.size // count if count else 0
+    rows = np.flatnonzero(unsure.reshape(count, width).any(axis=1)) if count else np.zeros(0, dtype=np.intp)
+    batch = max(1, EXACT_PAIRS // max(width, 1))
+    for start in range(0, len(rows), batch):
+        chosen = rows[start:start + batch]
+        done = exact_results(exact(chosen), op, na_rm)
+        picked, mask = result[chosen], unsure[chosen]
+        picked[mask] = done[mask]
+        result[chosen] = picked
+    if op == "sum" and min_count is not None:
+        result = np.where(pieces[PRESENT] >= min_count, result, np.float32(np.nan))
+    return result
 
 
 # ── The optional compiled kernel ────────────────────────────────────────────

@@ -309,7 +309,8 @@ def test_narrow_groups_are_decided_without_fractions(monkeypatch):
 
 def test_groups_spanning_wide_exponents_still_add_exactly(monkeypatch):
     big = 2.0**100
-    groups = [[big, 1.0, -big], [1e30, 3.0, -1e30, 1.0], [2.0**-140, 2.0**120, -(2.0**120)]]
+    groups = [[big, 1.0, -big], [1e30, 3.0, -1e30, 1.0], [2.0**-140, 2.0**120, -(2.0**120)],
+              [big, 1.0, -big, 2.0**-100], [1e30, 3.0, -1e30, 1.0, 2.0**-60]]  # what is left after cancelling spans wide exponents
     values = np.concatenate([np.asarray(g, F32) for g in groups])
     keys = np.repeat(np.arange(len(groups)), [len(g) for g in groups])
     calls = []
@@ -319,3 +320,118 @@ def test_groups_spanning_wide_exponents_still_add_exactly(monkeypatch):
         got = _reduced(values, keys, len(groups), op)
         assert same_bits(got, np.array([expected(np.asarray(g, F32), op, False) for g in groups], F32))
     assert calls  # these need the exact path in Python integers
+
+
+# ── Chunked data: the same bits whatever the chunking ───────────────────────
+
+
+def _chunked(values, keys, count, op, bounds, na_rm=False, min_count=None, calls=None):
+    """``sums.from_chunks`` over *values* cut at *bounds*, the chunks combined in a shuffled order."""
+    parts = [slice(a, b) for a, b in zip(bounds[:-1], bounds[1:])]
+    order = np.random.default_rng(len(bounds)).permutation(len(parts))
+    pieces = None
+    for i in order:
+        part = parts[i]
+        codes = None if keys is None else keys[part]
+        piece = sums.chunk_estimate(values[part], (0,), na_rm=na_rm, codes=codes, groups=count)
+        if pieces is None:
+            pieces = piece
+        else:
+            pieces[:sums.TERMS] += piece[:sums.TERMS]
+            pieces[sums.TERMS] = np.maximum(pieces[sums.TERMS], piece[sums.TERMS])
+
+    def exact(chosen):
+        if calls is not None:
+            calls.append(list(chosen))
+        codes = (lambda part: None) if keys is None else (lambda part: keys[part])
+        return sum(sums.chunk_exact(values[parts[i]], (0,), chosen, codes=codes(parts[i]), groups=count)
+                   for i in order)
+
+    return sums.from_chunks(pieces, len(parts), op, exact, na_rm=na_rm, min_count=min_count)
+
+
+def _bounds(n, chunks, seed=0):
+    """*chunks* uneven cuts of ``range(n)``, some possibly empty."""
+    cuts = np.sort(np.random.default_rng(seed).integers(0, n + 1, chunks - 1))
+    return [0, *cuts.tolist(), n]
+
+
+@pytest.mark.parametrize("chunks", [1, 3, 17, 400])
+@pytest.mark.parametrize("na_rm", [False, True])
+def test_chunked_grouped_sums_give_the_in_memory_bits_for_any_chunking(chunks, na_rm):
+    values, keys, groups = corpus()
+    count = len(groups)
+    for op in ("sum", "mean"):
+        want = _reduced(values, keys, count, op, na_rm=na_rm)
+        got = _chunked(values[:, None], keys, count, op, _bounds(len(values), chunks, seed=chunks), na_rm=na_rm)[:, 0]
+        wrong = differing(got, want)
+        assert not wrong.size, [(op, chunks, k, groups[k], got[k], want[k]) for k in wrong[:5]]
+        assert same_bits(want, np.array([expected(g, op, na_rm) for g in groups], F32))
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_chunk_boundaries_inside_tiny_groups_keep_the_ties_right(seed):
+    values, keys = tiny_groups(seed)
+    count = int(keys.max()) + 1
+    bounds = _bounds(len(values), 9, seed=seed)
+    for op in ("sum", "mean"):
+        calls = []
+        got = _chunked(values[:, None], keys, count, op, bounds, calls=calls)[:, 0]
+        want = np.array([expected(values[keys == k], op, False) for k in range(count)], F32)
+        assert same_bits(got, want)
+        assert calls and all(len(c) <= sums.EXACT_PAIRS for c in calls)  # ties need the exact pass
+
+
+def test_chunked_ungrouped_sums_keep_the_other_axes():
+    rng = np.random.default_rng(5)
+    values = (rng.normal(0, 1e4, (5000, 3)) * rng.choice([1, 2.0**-30, 2.0**30], (5000, 3))).astype(F32)
+    values[::7, 1] = values[1::7, 1] + np.spacing(values[1::7, 1]) / 2  # pairs on float32 ties
+    for op in ("sum", "mean"):
+        want = sums.reduce(values, op, (0,))
+        for chunks in (1, 4, 50):
+            got = _chunked(values, None, 1, op, _bounds(len(values), chunks, seed=chunks))[0]
+            assert same_bits(got, want), (op, chunks)
+        for j in range(3):
+            assert same_bits(want[j], expected(values[:, j], op, False))
+
+
+@pytest.mark.parametrize("na_rm", [False, True])
+def test_missing_and_infinite_values_settle_without_an_exact_pass(na_rm):
+    groups = [[1.0, np.nan, 2.0], [np.inf, 1.0], [-np.inf, 5.0], [np.inf, -np.inf], [np.nan, np.nan],
+              [np.inf, np.nan], [3e38, 3e38, 3e38], [1.0, 2.0, 3.0]]
+    values = np.concatenate([np.asarray(g, F32) for g in groups])
+    keys = np.repeat(np.arange(len(groups)), [len(g) for g in groups])
+    for op in ("sum", "mean"):
+        calls = []
+        got = _chunked(values[:, None], keys, len(groups), op, [0, 2, 5, 9, 12, 20], na_rm=na_rm, calls=calls)[:, 0]
+        want = np.array([expected(np.asarray(g, F32), op, na_rm) for g in groups], F32)
+        assert same_bits(got, want), (op, got, want)
+        assert calls == []
+
+
+def test_min_count_and_empty_chunks_across_chunks():
+    values = np.asarray([1.0, np.nan, 2.0, np.nan, np.nan, 4.0], F32)
+    keys = np.asarray([0, 0, 0, 1, 1, 1])
+    for min_count, want in ((2, [3.0, np.nan]), (1, [3.0, 4.0])):
+        got = _chunked(values[:, None], keys, 2, "sum", [0, 0, 2, 2, 6, 6], na_rm=True, min_count=min_count)[:, 0]
+        assert same_bits(got, np.asarray(want, F32))
+    assert same_bits(_chunked(values[:, None], keys, 2, "sum", [0, 6], na_rm=False)[:, 0], np.asarray([np.nan, np.nan], F32))
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_chunks_take_the_numpy_path_and_match_the_compiled_in_memory_bits(compiled, monkeypatch):
+    pytest.importorskip("numba")
+    monkeypatch.setattr(sums, "COMPILED", compiled)
+    rng = np.random.default_rng(3)
+    values = (rng.normal(0, 1e3, 400_000)).astype(F32)
+    keys = rng.integers(0, 32, len(values))
+    want = _reduced(values, keys, 32, "sum")  # compiled when installed and enabled: 400,000 values
+    assert same_bits(want, np.array([expected(values[keys == k], "sum", False) for k in range(32)], F32))
+    original = sums._compiled
+    monkeypatch.setattr(sums, "_compiled", lambda name: pytest.fail(f"a chunk used the compiled kernel {name}"))
+    bounds = [0, 150_000, 300_000, 400_000]  # chunks big enough for it in memory; chunks run in parallel instead
+    for op in ("sum", "mean"):
+        got = _chunked(values[:, None], keys, 32, op, bounds)[:, 0]
+        monkeypatch.setattr(sums, "_compiled", original)
+        assert same_bits(got, _reduced(values, keys, 32, op))
+        monkeypatch.setattr(sums, "_compiled", lambda name: pytest.fail(f"a chunk used the compiled kernel {name}"))
