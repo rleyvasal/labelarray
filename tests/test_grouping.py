@@ -119,3 +119,26 @@ def test_empty_bins_reduce_as_empty_groups(monkeypatch):
             _same_bits(fast, grouped.reduce(array, op, grouping, "point", "bin"))
             monkeypatch.setattr(grouped, "ONE_PASS", True)
     assert grouped.counts(grouping, "bin").data[-4:].tolist() == [0, 0, 0, 0]
+
+
+def test_label_arrays_are_kept_as_read_only_arrays():
+    codes = np.array([1, 0, 1, 2])
+    labels = np.array([10, 20, 30])
+    grouping = Grouping(codes, labels)
+    assert isinstance(grouping.labels, np.ndarray) and not grouping.labels.flags.writeable
+    labels[0] = 99  # the caller's array is not the stored one
+    assert grouping.labels.tolist() == [10, 20, 30] and len(grouping) == 3
+    assert isinstance(Grouping(codes, [10, 20, 30]).labels, list)  # lists stay lists
+
+
+@pytest.mark.parametrize("op", ["sum", "mean", "min", "count"])
+def test_label_arrays_give_the_same_results_as_lists(op):
+    rng = np.random.default_rng(3)
+    codes = rng.integers(0, 50, 400)
+    array = Array(rng.normal(size=(400, 2)).astype("float32"), ("point", "band"))
+    as_list = Grouping(codes, list(range(1, 51)))
+    as_array = Grouping(codes, np.arange(1, 51))
+    a = grouped.reduce(array, op, as_list, "point", "group")
+    b = grouped.reduce(array, op, as_array, "point", "group")
+    assert a.data.tobytes() == b.data.tobytes() and a.labels("group").tolist() == b.labels("group").tolist()
+    assert grouped.counts(as_array, "group").labels("group").tolist() == list(range(1, 51))

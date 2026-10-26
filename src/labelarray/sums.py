@@ -112,6 +112,35 @@ def _table(values, axes, kept, codes):
 def _in_order(values, axes, kept_shape, op, na_rm, min_count) -> np.ndarray:
     """Few values per result: float64, added first to last along *axes*, rounded once.
 
+    Without missing-value rules to apply, the few rows are converted to
+    float64 at once and added in the same order as ``_in_order_general``
+    (``0.0 + first``, then each row), the last addition of a sum written
+    straight into the float32 result: the same operations, so the same bits,
+    in fewer passes over the data than adding float32 rows one by one.
+    """
+    terms = math.prod(values.shape[a] for a in axes)
+    if na_rm or (op == "sum" and min_count is not None) or terms == 0:  # no rows: sums are +0.0, means NaN
+        return _in_order_general(values, axes, kept_shape, op, na_rm, min_count)
+    moved = np.moveaxis(values, axes, tuple(range(len(axes))))
+    rows = np.asarray(moved, dtype=np.float64).reshape(terms, *kept_shape)  # one converting copy, rows in order
+    total = rows[0, ...]  # a view, even with no kept axes, where rows[0] would be a scalar
+    np.add(total, 0.0, out=total)  # as 0.0 + first: a negative zero becomes +0.0
+    last = terms - 1 if op == "sum" and terms > 1 else terms
+    for k in range(1, last):
+        np.add(total, rows[k, ...], out=total)
+    if op == "mean":
+        np.divide(total, terms, out=total)
+        return total.astype(np.float32)
+    if last == terms:
+        return total.astype(np.float32)
+    result = np.empty(kept_shape, dtype=np.float32)
+    np.add(total, rows[-1, ...], out=result, casting="unsafe")  # added in float64, rounded once to float32
+    return result
+
+
+def _in_order_general(values, axes, kept_shape, op, na_rm, min_count) -> np.ndarray:
+    """Few values per result, with missing-value rules: each position along *axes* added in place in float64.
+
     Each position along the reduced axes is a view of the input, added in
     place, so no copy is made whatever the layout; missing values are
     counted only when ``na_rm`` or ``min_count`` needs them.

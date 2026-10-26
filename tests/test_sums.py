@@ -11,6 +11,7 @@ gives it. The compiled kernels (the ``fast`` extra) give the same bits.
 
 import math
 from fractions import Fraction
+from itertools import pairwise
 
 import numpy as np
 import pytest
@@ -327,7 +328,7 @@ def test_groups_spanning_wide_exponents_still_add_exactly(monkeypatch):
 
 def _chunked(values, keys, count, op, bounds, na_rm=False, min_count=None, calls=None):
     """``sums.from_chunks`` over *values* cut at *bounds*, the chunks combined in a shuffled order."""
-    parts = [slice(a, b) for a, b in zip(bounds[:-1], bounds[1:])]
+    parts = [slice(a, b) for a, b in pairwise(bounds)]
     order = np.random.default_rng(len(bounds)).permutation(len(parts))
     pieces = None
     for i in order:
@@ -337,7 +338,8 @@ def _chunked(values, keys, count, op, bounds, na_rm=False, min_count=None, calls
         if pieces is None:
             pieces = piece
         else:
-            pieces[:sums.TERMS] += piece[:sums.TERMS]
+            with np.errstate(invalid="ignore"):  # chunks holding +inf and -inf add to NaN, which the estimate expects
+                pieces[:sums.TERMS] += piece[:sums.TERMS]
             pieces[sums.TERMS] = np.maximum(pieces[sums.TERMS], piece[sums.TERMS])
 
     def exact(chosen):
@@ -435,3 +437,27 @@ def test_chunks_take_the_numpy_path_and_match_the_compiled_in_memory_bits(compil
         monkeypatch.setattr(sums, "_compiled", original)
         assert same_bits(got, _reduced(values, keys, 32, op))
         monkeypatch.setattr(sums, "_compiled", lambda name: pytest.fail(f"a chunk used the compiled kernel {name}"))
+
+
+@pytest.mark.parametrize("op", ["sum", "mean"])
+@pytest.mark.parametrize("seed", range(12))
+def test_few_values_without_missing_rules_give_the_general_paths_bits(op, seed):
+    rng = np.random.default_rng(seed)
+    count = int(rng.integers(1, sums.FEW))
+    width = int(rng.integers(1, 300))
+    values = (rng.normal(size=(count, width)) * 10.0 ** rng.uniform(-30, 30, (count, width))).astype(F32)
+    for special, share in ((np.nan, 0.05), (np.inf, 0.02), (-np.inf, 0.02), (-0.0, 0.1)):
+        values[rng.random(values.shape) < share] = special
+    values[:, 0] = -0.0  # a column of negative zeros sums to +0.0
+    layouts = [(values, (0,)), (np.ascontiguousarray(values.T), (1,)), (np.asfortranarray(values), (0,))]
+    layouts.append((values[:, 1], (0,)))  # one axis, reduced entirely: no kept axes
+    layouts.append((values[:0], (0,)))  # no positions to add, as a filter can leave
+    for data, axes in layouts:
+        kept = tuple(n for a, n in enumerate(data.shape) if a not in axes)
+        with np.errstate(all="ignore"):
+            fast = sums._in_order(data, axes, kept, op, False, None)
+            general = sums._in_order_general(data, axes, kept, op, False, None)
+        assert fast.dtype == general.dtype == F32
+        assert same_bits(fast, general)
+        if kept and data.shape[axes[0]]:  # the column of negative zeros, where there are values to add
+            assert not np.signbit(fast[0]) and fast[0] == 0

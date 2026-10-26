@@ -47,13 +47,21 @@ class Grouping:
     """Positions assigned to groups: one code per position, and each group's label.
 
     Codes are integers from 0 to ``len(labels) - 1``; ``labels[code]`` is the
-    group's label. ``counts()`` and ``blocks()`` are computed on first use and
-    kept, so a sort by group serves every reduction of the same grouping.
+    group's label. Labels given as a NumPy array are kept as one (a read-only
+    copy), which saves converting many labels to Python values and back;
+    other sequences become a list. ``counts()`` and ``blocks()`` are computed
+    on first use and kept, so a sort by group serves every reduction of the
+    same grouping.
     """
 
     def __init__(self, codes: Any, labels: Sequence[Any]):
         self.codes = np.asarray(codes)
-        self.labels = list(labels)
+        if isinstance(labels, np.ndarray):
+            labels = np.array(labels)  # a copy the caller cannot change
+            labels.flags.writeable = False
+            self.labels = labels
+        else:
+            self.labels = list(labels)
         self._counts: np.ndarray | None = None
         self._blocks: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
 

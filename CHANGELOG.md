@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.3 — 2026-10-26
+
+- `Grouping` keeps labels given as a NumPy array as one (a read-only
+  copy) instead of converting them to a list of Python values, which then
+  had to become an array again for every result: for 97,000 groups, about
+  3 ms per summary. Other sequences still become a list.
+- Sums and means of fewer than 8 float32 values per result, without
+  missing values to skip, convert those few rows to float64 at once and
+  add them in the same order as before, writing the last addition straight
+  into the float32 result: the same bits, about 10 µs less for three rows
+  of 34,688 values.
+- Tests: no warnings from combining chunks that hold infinities of both
+  signs; `itertools.pairwise` in the chunked tests.
+
 ## 0.1.2 — 2026-10-26
 
 - Float32 sums and means of data held in chunks (Dask) can be correctly
