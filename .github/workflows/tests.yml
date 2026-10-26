@@ -1,0 +1,83 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install labelarray
+        run: python -m pip install -e ".[dev]"
+      - name: Run tests
+        run: python -m pytest -q --tb=short
+
+  # The dependency floors in pyproject.toml, checked rather than assumed.
+  minimum-versions:
+    name: pytest (minimum NumPy and xarray)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install labelarray with its oldest supported dependencies
+        run: python -m pip install "numpy==2.0.*" "pandas==2.2.2" "xarray==2024.6.0" pytest -e .
+      - name: Run tests
+        run: python -m pytest -q --tb=short
+
+  distributions:
+    name: Source distribution, metadata, and installed wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Build the source distribution and its wheel
+        run: |
+          python -m pip install build twine
+          python -m build
+          python -m twine check --strict dist/*
+      - name: Install it in a clean environment and import
+        run: |
+          python -m venv /tmp/clean
+          /tmp/clean/bin/pip install dist/*.whl
+          cd /tmp && /tmp/clean/bin/python -c "import labelarray, numpy as np; a = labelarray.Array(np.arange(3.0), ('t',), {'t': [1, 2, 3]}); print(a.sel(t=2).data, labelarray.__version__)"
+      - name: Install it with the xarray extra and use xarray
+        run: |
+          python -m venv /tmp/full
+          /tmp/full/bin/pip install "$(ls dist/*.whl)[xarray]"
+          cd /tmp && /tmp/full/bin/python -c "import labelarray, numpy as np; a = labelarray.Array(np.arange(3.0), ('t',), {'t': [1, 2, 3]}); print(labelarray.Collection({'a': a}, a.coords).to_xarray())"
+      - name: Install it with the fast extra and use the compiled kernels
+        run: |
+          python -m venv /tmp/fast
+          /tmp/fast/bin/pip install "$(ls dist/*.whl)[fast]"
+          cd /tmp && /tmp/fast/bin/python -c "import numpy as np; from labelarray import sums; v = np.ones(200_000, np.float32); assert sums._compiled('grouped_estimate') is not None, 'compiled kernel not loaded'; print(sums.reduce(v, 'mean', (0,), codes=np.zeros(200_000, np.intp), groups=1))"
+      - name: Save validated distributions
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-distributions
+          path: dist/*
+          if-no-files-found: error

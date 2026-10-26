@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=77.0.3", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "labelarray"
+dynamic = ["version"]
+description = "Labelled N-D arrays in pure NumPy, with exact label semantics and reproducible reductions"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Rigoberto Leyva Salmeron" }]
+keywords = ["numpy", "arrays", "labelled arrays", "named axes", "xarray", "reproducibility"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering",
+]
+# NumPy 2's promotion rules are assumed throughout. NumPy is the only requirement.
+dependencies = [
+  "numpy>=2.0",
+]
+
+[project.optional-dependencies]
+# to_xarray() and from_xarray(). 2.2.2 is the first pandas built for NumPy 2;
+# older wheels fail to import alongside numpy>=2.0.
+xarray = ["xarray>=2024.6", "pandas>=2.2.2"]
+# Compiled grouped float32 sums and means (labelarray.sums); the same results as without it, faster.
+# 0.60 is the first Numba release for NumPy 2.0. Numba supports a new NumPy some months after it appears.
+fast = ["numba>=0.60"]
+# xarray and pandas: the references the tests compare with.
+# numba: the tests run the compiled path; the minimum-dependency job runs the NumPy path.
+dev = ["xarray>=2024.6", "pandas>=2.2.2", "numba>=0.60", "pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://github.com/rleyvasal/labelarray"
+
+[tool.setuptools.dynamic]
+version = { attr = "labelarray.__version__.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+labelarray = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
