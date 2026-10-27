@@ -142,3 +142,40 @@ def test_label_arrays_give_the_same_results_as_lists(op):
     b = grouped.reduce(array, op, as_array, "point", "group")
     assert a.data.tobytes() == b.data.tobytes() and a.labels("group").tolist() == b.labels("group").tolist()
     assert grouped.counts(as_array, "group").labels("group").tolist() == list(range(1, 51))
+
+
+@pytest.mark.parametrize("dtype, missing", [
+    ("float32", "nan"), ("float16", "nan"), ("float64", "nan"), ("complex64", "nan"),
+    ("datetime64[ns]", "NaT"), ("timedelta64[s]", "NaT"), ("int32", "float64"), ("bool", "float64"),
+])
+@pytest.mark.parametrize("op", ["min", "max"])
+def test_an_empty_min_or_max_is_missing_in_the_values_own_type(dtype, missing, op):
+    """A float, complex, or time type has its own missing value, so an empty group's min keeps the type: float32 stays
+    float32, and times are NaT, which a float NaN cannot be stacked with. Integers and booleans have none."""
+    values = (np.arange(6) if dtype.startswith(("datetime", "timedelta")) else np.arange(6) % 2).astype(dtype)
+    array = Array(values, ("point",))
+    nothing = array.isel(point=np.arange(0)).reduce(op, ["point"])
+    want = np.dtype(np.float64) if missing == "float64" else np.dtype(dtype)
+    assert nothing.data.dtype == want
+    assert np.isnat(nothing.data) if missing == "NaT" else np.isnan(nothing.data)
+    codes, labels = factorize(np.array([0.5, 0.5, 2.5, 2.5, 2.5, 0.5]), Bins([0, 1, 2, 3]))  # the middle bin is empty
+    result = grouped.reduce(array, op, Grouping(codes, labels), "point", "bin")
+    assert result.data.dtype == want
+    assert (np.isnat if missing == "NaT" else np.isnan)(result.data[1])
+    present = [array.isel(point=np.flatnonzero(codes == code)).reduce(op, ["point"]).data for code in (0, 2)]
+    assert result.data[[0, 2]].astype(want).tolist() == np.array(present).astype(want).tolist()
+
+
+@pytest.mark.parametrize("op, want", [("min", ["a", "c"]), ("max", ["b", "d"])])
+def test_text_takes_min_and_max_as_objects(op, want):
+    """NumPy's text types have no loop for min and max; text compares as Python objects, and the result is objects,
+    which an empty group's NaN can sit among."""
+    array = Array(np.array(list("bacd")), ("point",))
+    whole = array.reduce(op, ["point"])
+    assert whole.data.dtype == object and whole.data[()] == ("a" if op == "min" else "d")
+    result = grouped.reduce(array, op, Grouping(np.array([0, 0, 1, 1]), [1, 2]), "point", "group")
+    assert result.data.dtype == object and result.data.tolist() == want
+    codes, labels = factorize(np.array([0.5, 0.5, 2.5, 2.5]), Bins([0, 1, 2, 3]))  # the middle bin is empty
+    binned = grouped.reduce(array, op, Grouping(codes, labels), "point", "bin")
+    assert binned.data.dtype == object and binned.data[0] == want[0] and binned.data[2] == want[1]
+    assert binned.data[1] != binned.data[1]  # NaN

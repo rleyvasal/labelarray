@@ -445,6 +445,18 @@ _REDUCERS = {
 }
 
 
+def _missing_of(dtype: np.dtype) -> tuple[Any, np.dtype]:
+    """The missing value of *dtype* and the type that holds it: a float or complex type's own NaN, a time type's NaT,
+    text and objects as NaN in an object array; integers and booleans have none, so float64's NaN."""
+    if dtype.kind in "fc":
+        return np.nan, dtype
+    if dtype.kind in "mM":
+        return np.array("NaT", dtype=dtype)[()], dtype
+    if dtype.kind in "OUS":
+        return np.nan, np.dtype(object)
+    return np.nan, np.dtype(np.float64)
+
+
 def _reduce_data(data: np.ndarray, op: str, axes: int | tuple[int, ...], na_rm: bool, min_count: int | None) -> Any:
     """NumPy reductions with missing values handled as xarray handles them."""
     kind = data.dtype.kind
@@ -454,7 +466,9 @@ def _reduce_data(data: np.ndarray, op: str, axes: int | tuple[int, ...], na_rm: 
     missing = None if not needs_missing else np.isnan(data) if kind in "fc" else np.isnat(data) if kind in "mM" else None
     if op in ("min", "max") and builtins.any(data.shape[axis] == 0 for axis in numbers):
         shape = tuple(n for i, n in enumerate(data.shape) if i not in numbers)
-        return np.full(shape, np.nan)
+        return np.full(shape, *_missing_of(data.dtype))
+    if op in ("min", "max") and kind in "US":  # NumPy's text types have no loop for min and max; objects compare
+        return np.asarray(_REDUCERS[op][0](data.astype(object), axis=axes), dtype=object)
     with warnings.catch_warnings(), np.errstate(all="ignore"):
         warnings.simplefilter("ignore", RuntimeWarning)
         if op in ("any", "all"):

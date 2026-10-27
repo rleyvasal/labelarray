@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.4 — 2026-10-27
+
+- `min` and `max` of no positions, or of an empty group, give the missing
+  value of the values' own type: a float or complex type's NaN (float32
+  stays float32), a time type's NaT, NaN among objects. Only integers and
+  booleans, which have no missing value, give float64's NaN, as before. A
+  float NaN beside times could not be stacked, so `min` of times grouped
+  with an empty bin failed.
+- Text takes `min` and `max`: NumPy's text types have no loop for them, so
+  text compares as Python objects, and the result is objects, which an
+  empty group's NaN can sit among.
+
 ## 0.1.3 — 2026-10-26
 
 - `Grouping` keeps labels given as a NumPy array as one (a read-only
