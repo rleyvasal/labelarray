@@ -181,7 +181,8 @@ def _sum_type(values: np.ndarray) -> np.dtype:
 
 
 def reduce(array: Array, op: str, grouping: Grouping, axis: Hashable, name: Hashable,
-           others: Sequence[Hashable] = (), *, na_rm: bool = False, min_count: int | None = None) -> Array:
+           others: Sequence[Hashable] = (), *, na_rm: bool = False, min_count: int | None = None,
+           q: float | None = None) -> Array:
     """*op* per group of positions on *axis*, and over *others*: the groups along a new first axis *name*.
 
     Each group's result is bit-identical to reducing that group on its own
@@ -197,13 +198,14 @@ def reduce(array: Array, op: str, grouping: Grouping, axis: Hashable, name: Hash
     fast = _one_pass_array(array, op, grouping, axis, name, others, na_rm, min_count)
     if fast is not None:
         return fast
-    stats = [part.reduce(op, [axis, *others], na_rm=na_rm, min_count=min_count)
+    stats = [part.reduce(op, [axis, *others], na_rm=na_rm, min_count=min_count, q=q)
              for part in _group_parts(array, grouping, axis)]
     labels = labels_from(grouping.labels)
     if stats:
         data = np.stack([s.data for s in stats])
         return Array._make(data, (name, *stats[0].dims), {name: labels, **stats[0].coords})
-    empty = _take(array, axis, builtins.slice(0, 0)).reduce(op, [axis, *others], na_rm=na_rm, min_count=min_count)
+    empty = _take(array, axis, builtins.slice(0, 0)).reduce(op, [axis, *others], na_rm=na_rm, min_count=min_count,
+                                                            q=q)
     return Array._make(empty.data[np.newaxis][:0], (name, *empty.dims), {name: labels, **empty.coords})
 
 

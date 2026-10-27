@@ -126,12 +126,13 @@ class Array:
     # ── Computation ─────────────────────────────────────────────────────────
 
     def reduce(self, op: str, axes: Sequence[Hashable], *, na_rm: bool = False,
-               min_count: int | None = None) -> Array:
-        """*op* (sum, mean, min, max, median, std, var, any, all, count) over *axes*.
+               min_count: int | None = None, q: float | None = None) -> Array:
+        """*op* (sum, mean, min, max, median, quantile, std, var, any, all, count) over *axes*.
 
         Float32 sums and means are correctly rounded (``labelarray.sums``); other
         reductions are NumPy's. ``na_rm`` skips missing values; a sum with
-        ``min_count`` is missing where fewer values are present.
+        ``min_count`` is missing where fewer values are present; a quantile takes
+        ``q`` between 0 and 1, NumPy's default (linear) rule.
         """
         axes = list(axes)
         if not axes:
@@ -142,7 +143,7 @@ class Array:
         else:
             # One axis goes to NumPy as an integer, as xarray passes it: NumPy sums a
             # tuple of axes in another order, which changes float results in the last bit.
-            result = _reduce_data(self.data, op, numbers[0] if len(numbers) == 1 else numbers, na_rm, min_count)
+            result = _reduce_data(self.data, op, numbers[0] if len(numbers) == 1 else numbers, na_rm, min_count, q)
         dims = tuple(d for d in self.dims if d not in axes)
         return Array._make(np.asarray(result), dims, {d: c for d, c in self.coords.items() if d in dims})
 
@@ -457,7 +458,8 @@ def _missing_of(dtype: np.dtype) -> tuple[Any, np.dtype]:
     return np.nan, np.dtype(np.float64)
 
 
-def _reduce_data(data: np.ndarray, op: str, axes: int | tuple[int, ...], na_rm: bool, min_count: int | None) -> Any:
+def _reduce_data(data: np.ndarray, op: str, axes: int | tuple[int, ...], na_rm: bool, min_count: int | None,
+                 q: float | None = None) -> Any:
     """NumPy reductions with missing values handled as xarray handles them."""
     kind = data.dtype.kind
     numbers = (axes,) if isinstance(axes, int) else axes
@@ -469,6 +471,17 @@ def _reduce_data(data: np.ndarray, op: str, axes: int | tuple[int, ...], na_rm: 
         return np.full(shape, *_missing_of(data.dtype))
     if op in ("min", "max") and kind in "US":  # NumPy's text types have no loop for min and max; objects compare
         return np.asarray(_REDUCERS[op][0](data.astype(object), axis=axes), dtype=object)
+    if op == "quantile":
+        if q is None or isinstance(q, (bool, np.bool_)) or not 0 <= float(q) <= 1:
+            raise ValueError(f"a quantile takes q between 0 and 1, not {q!r}")
+        if builtins.any(data.shape[axis] == 0 for axis in numbers):  # NumPy cannot take one of nothing: missing
+            shape = tuple(n for i, n in enumerate(data.shape) if i not in numbers)
+            result = np.quantile(np.zeros(1, data.dtype), float(q)).dtype
+            return np.full(shape, *_missing_of(result))
+        with warnings.catch_warnings(), np.errstate(all="ignore"):
+            warnings.simplefilter("ignore", RuntimeWarning)
+            quantile = np.nanquantile if na_rm and kind in "fcmM" else np.quantile
+            return quantile(data, float(q), axis=axes)
     with warnings.catch_warnings(), np.errstate(all="ignore"):
         warnings.simplefilter("ignore", RuntimeWarning)
         if op in ("any", "all"):

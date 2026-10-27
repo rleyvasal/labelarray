@@ -20,7 +20,7 @@ It is deliberately small. What it offers that other array libraries do not:
 3. **Collections.** Arrays sharing axes, with one label array per axis,
    joined and aligned under those rules.
 
-**Status:** version `0.1.4`; the API may still
+**Status:** version `0.1.5`; the API may still
 change before 1.0. What changed in each release is in
 [CHANGELOG.md](CHANGELOG.md).
 

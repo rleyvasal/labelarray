@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.5 — 2026-10-27
+
+- `quantile`: `Array.reduce("quantile", axes, q=...)` and
+  `grouped.reduce(..., "quantile", ..., q=...)` give NumPy's quantile
+  (its default, linear rule), `np.nanquantile` with `na_rm`, in the type
+  NumPy gives (float32 stays float32, integers give float64, durations
+  durations); `q` must lie between 0 and 1. Of no positions, or of an
+  empty group, it is the missing value of that type, where NumPy raises.
+
 ## 0.1.4 — 2026-10-27
 
 - `min` and `max` of no positions, or of an empty group, give the missing

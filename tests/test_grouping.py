@@ -179,3 +179,32 @@ def test_text_takes_min_and_max_as_objects(op, want):
     binned = grouped.reduce(array, op, Grouping(codes, labels), "point", "bin")
     assert binned.data.dtype == object and binned.data[0] == want[0] and binned.data[2] == want[1]
     assert binned.data[1] != binned.data[1]  # NaN
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float64", "int32", "timedelta64[ns]"])
+@pytest.mark.parametrize("q", [0.0, 0.3, 0.5, 0.9, 1.0])
+@pytest.mark.parametrize("na_rm", [False, True])
+def test_a_quantile_is_numpy_s_with_its_type_and_empty_groups_missing(dtype, q, na_rm):
+    rng = np.random.default_rng(2)
+    values = (rng.normal(size=60) * 100).astype(dtype) if dtype != "timedelta64[ns]" else rng.integers(
+        -1_000, 1_000, 60).astype(dtype)
+    if dtype.startswith("float"):
+        values[[3, 17]] = np.nan
+    array = Array(values, ("point",))
+    whole = array.reduce("quantile", ["point"], na_rm=na_rm, q=q)
+    quantile = np.nanquantile if na_rm and dtype.startswith("float") else np.quantile
+    want = quantile(values, q)
+    assert whole.data.dtype == np.asarray(want).dtype and whole.data.tobytes() == np.asarray(want).tobytes()
+    codes, labels = factorize(np.where(np.arange(60) < 30, 0.5, 2.5), Bins([0, 1, 2, 3]))  # the middle bin is empty
+    result = grouped.reduce(array, "quantile", Grouping(codes, labels), "point", "bin", na_rm=na_rm, q=q)
+    assert result.data.dtype == np.asarray(want).dtype
+    for code, part in ((0, values[:30]), (2, values[30:])):
+        assert result.data[code].tobytes() == np.asarray(quantile(part, q)).tobytes()
+    empty = result.data[1]
+    assert np.isnat(empty) if dtype.startswith("timedelta") else np.isnan(empty)
+
+
+@pytest.mark.parametrize("q", [None, -0.1, 1.5, True])
+def test_a_quantile_needs_q_between_0_and_1(q):
+    with pytest.raises(ValueError, match="q between 0 and 1"):
+        Array(np.arange(5.0), ("point",)).reduce("quantile", ["point"], q=q)
