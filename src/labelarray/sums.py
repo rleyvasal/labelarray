@@ -446,6 +446,10 @@ def chunk_estimate(values: np.ndarray, axes: Sequence[int], *, na_rm: bool = Fal
     kept = tuple(a for a in range(values.ndim) if a not in axes)
     kept_shape = tuple(values.shape[a] for a in kept)
     count = groups if codes is not None else 1
+    if codes is not None and math.prod(values.shape[a] for a in axes[1:]) > 1:
+        with np.errstate(all="ignore"):
+            pieces = np.stack(_by_position(values, axes, kept, np.asarray(codes), count, na_rm)).astype(np.float64)
+        return pieces.reshape((PIECES, count, *kept_shape))
     with np.errstate(all="ignore"):
         table, rows, _ = _table(values, axes, kept, codes)
         total, magnitude, present, counted, terms, _ = _estimate(table, rows, count, None, na_rm, compiled=False)
@@ -459,6 +463,46 @@ def chunk_estimate(values: np.ndarray, axes: Sequence[int], *, na_rm: bool = Fal
             minus = np.bincount(key, weights=(table == -np.inf).ravel(), minlength=count * width).reshape(count, width)
     pieces = np.stack([total, magnitude, present, counted, plus, minus, terms]).astype(np.float64)
     return pieces.reshape((PIECES, count, *kept_shape))
+
+
+def _by_position(values, axes, kept, codes, groups, na_rm):
+    """``chunk_estimate``'s pieces with a code per position on the first axis: each position's values summed first
+    (its total, its magnitudes, and its values present, +inf, and -inf counted), then the positions per group in
+    chunks, as ``_estimate`` adds them, so no code is repeated for each value. A value passes through at most the
+    position's additions and then the group's, which the terms count, so ``_certify``'s bound holds."""
+    positions = values.shape[axes[0]]
+    others = math.prod(values.shape[a] for a in axes[1:])
+    width = math.prod(values.shape[a] for a in kept)
+    cube = np.transpose(values, axes + kept).reshape(positions, others, width)
+    missing = np.isnan(cube)
+    weights = np.where(missing, np.float32(0), cube) if na_rm and missing.any() else cube
+    rows_total = weights.sum(axis=1, dtype=np.float64)
+    rows_magnitude = np.abs(weights).sum(axis=1, dtype=np.float64)
+    rows_present = others - missing.sum(axis=1)
+    sizes = np.bincount(codes, minlength=groups)
+    chunks = max(1, min(math.isqrt(positions), _BINS // max(groups, 1)))
+    length = -(-positions // chunks) if positions else 0
+    key = codes if chunks == 1 else (np.arange(positions) // length) * groups + codes
+    bins = chunks * groups
+    total = np.empty((groups, width))
+    magnitude = np.empty((groups, width))
+    present = np.empty((groups, width))
+    plus = np.zeros((groups, width))
+    minus = np.zeros((groups, width))
+    infinite = np.isinf(cube).any()
+    for column in range(width):
+        total[:, column] = np.bincount(key, weights=rows_total[:, column], minlength=bins).reshape(chunks, groups).sum(0)
+        magnitude[:, column] = np.bincount(key, weights=rows_magnitude[:, column],
+                                           minlength=bins).reshape(chunks, groups).sum(0)
+        present[:, column] = np.bincount(codes, weights=rows_present[:, column], minlength=groups)
+        if infinite:
+            plus[:, column] = np.bincount(codes, weights=(cube[:, :, column] == np.inf).sum(axis=1), minlength=groups)
+            minus[:, column] = np.bincount(codes, weights=(cube[:, :, column] == -np.inf).sum(axis=1),
+                                           minlength=groups)
+    counted = np.repeat((sizes * others)[:, None], width, axis=1)
+    effective = others + np.minimum(sizes, length) + np.minimum(sizes, chunks)  # the position's, then the group's
+    terms = np.repeat(np.minimum(sizes * others, effective)[:, None], width, axis=1)
+    return total, magnitude, present, counted, plus, minus, terms
 
 
 def settle(pieces: np.ndarray, chunks: int, op: str, na_rm: bool) -> tuple[np.ndarray, np.ndarray]:

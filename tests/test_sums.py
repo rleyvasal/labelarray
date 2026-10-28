@@ -461,3 +461,62 @@ def test_few_values_without_missing_rules_give_the_general_paths_bits(op, seed):
         assert same_bits(fast, general)
         if kept and data.shape[axes[0]]:  # the column of negative zeros, where there are values to add
             assert not np.signbit(fast[0]) and fast[0] == 0
+
+
+# ── A code per position, several values each ────────────────────────────────
+
+
+def _positions(seed):
+    """Positions of five values each, with a code per position: ties, cancellation, NaN, and infinities."""
+    rng = np.random.default_rng(seed)
+    count, others, groups = 300, 5, 7
+    values = (rng.normal(size=(count, others)) * 10.0 ** rng.integers(-3, 8, (count, 1))).astype(F32)
+    values[rng.random(values.shape) < 0.02] = np.nan
+    values[5:7] = 0
+    values[5, :3] = [F32(2**24), F32(1), F32(1)]  # with the next position, 2**24 + 3: a tie between float32s
+    values[6, :3] = [F32(2**30), F32(-(2**30)), F32(1)]  # cancelling, which the estimate cannot settle alone
+    values[7, 0], values[8, 1], values[9, 2] = np.inf, -np.inf, np.inf
+    keys = rng.integers(0, groups - 1, count)
+    keys[5:7] = groups - 1  # the tie's group, of these two positions alone
+    return values, keys, groups
+
+
+@pytest.mark.parametrize("chunks", [1, 4, 37])
+@pytest.mark.parametrize("na_rm", [False, True])
+def test_a_code_per_position_gives_the_in_memory_bits(chunks, na_rm):
+    """``chunk_estimate`` over positions of several values with one code each sums each position first, without
+    repeating its code; the chunks combined, and the exact pass where it runs, give the correctly rounded results."""
+    values, keys, groups = _positions(chunks)
+    parts = [slice(a, b) for a, b in pairwise(_bounds(len(values), chunks, seed=chunks))]
+    for op in ("sum", "mean"):
+        pieces = None
+        for part in parts:
+            piece = sums.chunk_estimate(values[part], (0, 1), na_rm=na_rm, codes=keys[part], groups=groups)
+            if pieces is None:
+                pieces = piece
+            else:
+                with np.errstate(invalid="ignore"):
+                    pieces[:sums.TERMS] += piece[:sums.TERMS]
+                pieces[sums.TERMS] = np.maximum(pieces[sums.TERMS], piece[sums.TERMS])
+
+        asked = []
+
+        def exact(chosen):
+            asked.extend(chosen)
+            return sum(sums.chunk_exact(values[part], (0, 1), chosen, codes=keys[part], groups=groups)
+                       for part in parts)
+
+        got = sums.from_chunks(pieces, len(parts), op, exact, na_rm=na_rm)
+        assert op == "mean" or groups - 1 in asked  # the tie's sum needs the exact pass (its mean is no tie)
+        want = np.array([expected(values[keys == group].ravel(), op, na_rm) for group in range(groups)], F32)
+        assert same_bits(got, want), (op, got, want)
+
+
+def test_a_code_per_position_counts_as_the_codes_repeated():
+    values, keys, groups = _positions(0)
+    for na_rm in (False, True):
+        first = sums.chunk_estimate(values, (0, 1), na_rm=na_rm, codes=keys, groups=groups)
+        repeated = sums.chunk_estimate(values.ravel(), (0,), na_rm=na_rm, codes=np.repeat(keys, values.shape[1]),
+                                       groups=groups)
+        assert np.array_equal(first[sums.PRESENT:sums.TERMS], repeated[sums.PRESENT:sums.TERMS])
+        assert np.allclose(first[:sums.PRESENT], repeated[:sums.PRESENT], rtol=1e-12, equal_nan=True)
