@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- An estimate's total can be marked exact: `sums.EXACT` in its `TERMS`
+  piece says no addition into the total rounded, which a producer such as
+  a compiled kernel knows from each addition's error term
+  (`chunk_estimate` never sets it). `sums.merge(held, piece)` combines two
+  sets of pieces as before and keeps the mark only where adding the two
+  totals was exact too (Knuth's two-sum error). `settle` rounds a marked
+  result from its total directly, ties to even, with no error bound, so the
+  ties a bound cannot decide (the mean of a few float32 values that lies
+  between two of them) need no exact sums. On 10M points in 533,985 voxels,
+  the 21,470 means the bound left to the exact pass all settle so.
+
 ## 0.1.6 — 2026-10-28
 
 - `grouped.merge_sorted(first, second)`: two sorted arrays of distinct

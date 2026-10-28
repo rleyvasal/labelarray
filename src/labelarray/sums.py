@@ -364,6 +364,21 @@ def _whole(buckets: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return whole, first, fits
 
 
+def _from_total(total: np.ndarray, divisor: np.ndarray) -> np.ndarray:
+    """``total / divisor`` correctly rounded to float32, for exact float64 totals: each total as an integer below
+    2**53 times a power of two (``np.frexp``), halved while even so most fall below ``_rounded``'s 2**52."""
+    fraction, exponent = np.frexp(total)
+    whole = (fraction * 2.0**53).astype(np.int64)
+    scale = exponent.astype(np.int64) - 53
+    for _ in range(53):
+        even = (whole != 0) & (whole % 2 == 0) & (np.abs(whole) >= 2**52)
+        if not even.any():
+            break
+        whole = np.where(even, whole // 2, whole)
+        scale = np.where(even, scale + 1, scale)
+    return _rounded(whole, scale, divisor)
+
+
 def _rounded(whole: np.ndarray, scale, divisor: np.ndarray) -> np.ndarray:
     """``whole * 2**scale / divisor`` correctly rounded to float32, ties to even, for |whole| below 2**52.
 
@@ -421,6 +436,7 @@ def _round32(value: Fraction) -> np.float32:
 PIECES = 7
 TOTAL, MAGNITUDE, PRESENT, VALUES, PLUS, MINUS, TERMS = range(PIECES)
 BUCKETS = 254 + 4  # one per float32 exponent, then values present, NaN, +inf, and -inf
+EXACT = -1  # TERMS of a total known to be the exact sum: no addition into it rounded
 EXACT_PAIRS = 1 << 14  # (group, column) pairs per exact pass: 33 MB of buckets per chunk
 
 
@@ -435,7 +451,11 @@ def chunk_estimate(values: np.ndarray, axes: Sequence[int], *, na_rm: bool = Fal
     except ``TERMS``, whose maximum is taken (``settle`` adds the number of
     chunks to it: Higham's lemma 3.3, where a float64 sum of totals each
     within gamma(n_i) of exact is within gamma(max n_i + k) of exact). The
-    integers stay exact in float64 below 2**53 values. The NumPy path
+    integers stay exact in float64 below 2**53 values. A producer that knows
+    a group's total is exact (a kernel whose every addition into it was
+    exact, by its error term) may set its ``TERMS`` to ``EXACT``; pieces that
+    may hold it combine with ``merge``, which keeps it only where adding the
+    totals was exact too. This function never sets it. The NumPy path
     estimates every chunk: chunks run in parallel already, and the compiled
     kernel's own threads cannot be entered from several at once.
     """
@@ -505,17 +525,45 @@ def _by_position(values, axes, kept, codes, groups, na_rm):
     return total, magnitude, present, counted, plus, minus, terms
 
 
+def merge(held: np.ndarray, piece: np.ndarray) -> np.ndarray:
+    """Two chunks' (or two merged sets of chunks') estimate pieces as one: every piece adds and ``TERMS`` takes the
+    maximum, as ``chunk_estimate`` says, and two exact totals stay ``EXACT`` only where their float64 sum is exact,
+    which Knuth's two-sum error decides; else the sum's one rounding is one term."""
+    held, piece = np.asarray(held, dtype=np.float64), np.asarray(piece, dtype=np.float64)
+    merged = held + piece
+    merged[TERMS] = np.maximum(held[TERMS], piece[TERMS])
+    both = (held[TERMS] == EXACT) & (piece[TERMS] == EXACT)
+    if both.any():
+        with np.errstate(all="ignore"):
+            first, second, total = held[TOTAL], piece[TOTAL], merged[TOTAL]
+            back = total - first
+            error = (first - (total - back)) + (second - back)
+            rounded = both & ((error != 0) | ~np.isfinite(total))
+        merged[TERMS] = np.where(rounded, 1, merged[TERMS])
+    return merged
+
+
 def settle(pieces: np.ndarray, chunks: int, op: str, na_rm: bool) -> tuple[np.ndarray, np.ndarray]:
     """Results the combined *pieces* of *chunks* chunks settle, and where they do not: ``(result, unsure)``.
 
     Where the error bound proves the rounding, the result is the correctly
     rounded one; NaN, +inf and -inf follow the missing-value rules from the
-    counts; a mean of no values is NaN. The rest, ``unsure``, need exact sums.
+    counts; a mean of no values is NaN. A total marked ``EXACT`` is the exact
+    sum, so its result is rounded from it directly (``_rounded``), with no
+    bound, which decides the ties a bound cannot. The rest, ``unsure``, need
+    exact sums.
     """
     with np.errstate(all="ignore"):
         total, magnitude, present, counted, plus, minus, terms = pieces
         counts = present if na_rm else counted
-        result, sure = _certify(total, magnitude, terms + chunks, counts, op, False)
+        exact = terms == EXACT
+        result, sure = _certify(total, magnitude, np.where(exact, 0, terms) + chunks, counts, op, False)
+        if exact.any():
+            divisor = counts if op == "mean" else np.ones_like(counts)
+            known = exact & np.isfinite(total) & (divisor > 0) & (divisor < 2**35)
+            if known.any():
+                result[known] = _from_total(total[known], divisor[known].astype(np.int64))
+                sure |= known
         undefined = ((counted - present > 0) & (not na_rm)) | ((plus > 0) & (minus > 0))
         infinite = ((plus > 0) | (minus > 0)) & ~undefined
         result[undefined] = np.nan

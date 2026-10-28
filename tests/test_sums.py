@@ -520,3 +520,59 @@ def test_a_code_per_position_counts_as_the_codes_repeated():
                                        groups=groups)
         assert np.array_equal(first[sums.PRESENT:sums.TERMS], repeated[sums.PRESENT:sums.TERMS])
         assert np.allclose(first[:sums.PRESENT], repeated[:sums.PRESENT], rtol=1e-12, equal_nan=True)
+
+
+# ── Exact totals (EXACT): rounded from the total itself ───────────────────
+
+
+def test_an_exact_total_is_rounded_as_its_fraction_is():
+    """``_from_total`` against Python fractions: totals of every size, odd 53-bit mantissas among them, divisors up
+    to 2**34, ties, and results down to float32's subnormals."""
+    rng = np.random.default_rng(5)
+    totals = np.concatenate([
+        rng.normal(size=4_000) * 10.0 ** rng.integers(-40, 39, 4_000),
+        np.ldexp(rng.integers(2**52, 2**53, 1_000).astype(np.float64) * rng.choice([-1, 1], 1_000),
+                 rng.integers(-180, 80, 1_000)),  # 53 significant bits, odd as often as not
+        (np.arange(-50, 50) + 0.5) * 2.0**-20,  # halves of a float32 step at 1
+        np.array([0.0, -0.0, 3.4e38, -3.5e38, 1e-45, 7e-46]),
+    ])
+    divisors = np.concatenate([np.ones(2_000, np.int64), rng.integers(1, 1_000, len(totals) - 2_100),
+                               rng.integers(1, 2**34, 100)])
+    got = sums._from_total(totals, divisors)
+    for total, divisor, value in zip(totals, divisors, got):
+        want = sums._round32(Fraction(float(total)) / int(divisor))
+        assert value.tobytes() == want.tobytes() or (total == 0 and value == 0), (total, divisor, value, want)
+
+
+def test_settle_rounds_exact_totals_where_the_bound_cannot():
+    """Means of two adjacent float32 values lie on a tie, which the bound leaves unsure; marked exact, they settle to
+    the tie rounded to even, as the exact sums give them."""
+    rng = np.random.default_rng(6)
+    first = (rng.normal(size=500) * 100).astype(np.float32)
+    values = np.stack([first, np.nextafter(first, np.float32(np.inf))], axis=1).ravel()
+    codes = np.repeat(np.arange(500), 2)
+    pieces = sums.chunk_estimate(values, (0,), codes=codes, groups=500)
+    plain, unsure = sums.settle(pieces, 1, "mean", False)
+    assert unsure.sum() > 400  # the ties the bound cannot decide
+    marked = pieces.copy()
+    marked[sums.TERMS] = sums.EXACT  # two float32 values add exactly in float64
+    result, unsure = sums.settle(marked, 1, "mean", False)
+    assert not unsure.any()
+    want = sums.reduce(values, "mean", (0,), codes=codes, groups=500)
+    assert result.tobytes() == want.tobytes()
+    sure = ~sums.settle(pieces, 1, "sum", False)[1]
+    assert np.array_equal(sums.settle(marked, 1, "sum", False)[0][sure], sums.settle(pieces, 1, "sum", False)[0][sure])
+
+
+def test_merge_keeps_exact_only_where_adding_the_totals_was_exact():
+    def piece(total, terms):
+        return np.array([[total], [abs(total)], [1.0], [1.0], [0.0], [0.0], [terms]])
+
+    exact = sums.merge(piece(1.5, sums.EXACT), piece(2.25, sums.EXACT))
+    assert exact[sums.TERMS, 0] == sums.EXACT and exact[sums.TOTAL, 0] == 3.75
+    rounded = sums.merge(piece(1.0, sums.EXACT), piece(2.0**-60, sums.EXACT))  # 1 + 2**-60 rounds in float64
+    assert rounded[sums.TERMS, 0] == 1
+    mixed = sums.merge(piece(1.0, sums.EXACT), piece(2.0, 7))
+    assert mixed[sums.TERMS, 0] == 7
+    assert np.array_equal(sums.merge(piece(1.0, 3), piece(2.0, 5))[:sums.TERMS],
+                          (piece(1.0, 3) + piece(2.0, 5))[:sums.TERMS])
