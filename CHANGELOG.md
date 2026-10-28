@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.7 — 2026-10-28
 
 - An estimate's total can be marked exact: `sums.EXACT` in its `TERMS`
   piece says no addition into the total rounded, which a producer such as
