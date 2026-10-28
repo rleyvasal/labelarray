@@ -43,6 +43,25 @@ ONE_PASS = True
 FEW_GROUPS = 8
 
 
+def merge_sorted(first: np.ndarray, second: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Two sorted arrays of distinct keys as one: their union, sorted and distinct, and where each one's keys stand in
+    it, as ``np.union1d`` and ``np.searchsorted`` give them, without hashing or sorting the union again: a compiled
+    two-pointer merge with ``labelarray[fast]``, else a stable sort, which merges the two runs it is given in one
+    pass. For keeping a table of groups as blocks of data are merged into it."""
+    first, second = np.asarray(first), np.asarray(second)
+    kernel = sums._compiled("merge_sorted")
+    if kernel is not None and first.dtype == second.dtype and first.dtype.kind in "iu":
+        return kernel(first, second)
+    keys = np.concatenate([first, second])
+    order = np.argsort(keys, kind="stable")
+    ordered = keys[order]
+    new = np.ones(len(keys), dtype=bool)
+    new[1:] = ordered[1:] != ordered[:-1]
+    at = np.empty(len(keys), dtype=np.intp)
+    at[order] = np.cumsum(new) - 1
+    return ordered[new], at[:len(first)], at[len(first):]
+
+
 class Grouping:
     """Positions assigned to groups: one code per position, and each group's label.
 

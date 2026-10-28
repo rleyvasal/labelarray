@@ -10,7 +10,7 @@ computes it.
 import numpy as np
 import pytest
 
-from labelarray import Array, Bins, Grouping, factorize, grouped
+from labelarray import Array, Bins, Grouping, factorize, grouped, sums
 
 OPS = ["sum", "mean", "min", "max", "any", "all", "std", "median", "count"]
 
@@ -208,3 +208,28 @@ def test_a_quantile_is_numpy_s_with_its_type_and_empty_groups_missing(dtype, q, 
 def test_a_quantile_needs_q_between_0_and_1(q):
     with pytest.raises(ValueError, match="q between 0 and 1"):
         Array(np.arange(5.0), ("point",)).reduce("quantile", ["point"], q=q)
+
+
+# ── Merging two tables' sorted keys ─────────────────────────────────────────
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_merge_sorted_is_union1d_and_searchsorted(compiled, monkeypatch):
+    if compiled:
+        pytest.importorskip("numba")
+    else:
+        monkeypatch.setitem(sums._KERNELS, "merge_sorted", None)
+    rng = np.random.default_rng(3)
+    cases = [(np.unique(rng.integers(0, 2_000, 700)), np.unique(rng.integers(0, 2_000, 500))),
+             (np.arange(0, 100, 2), np.arange(1, 100, 2)),  # disjoint, interleaved
+             (np.arange(50), np.arange(50)),  # the same keys
+             (np.arange(10), np.arange(100, 110)),  # one after the other
+             (np.zeros(0, np.int64), np.arange(5)), (np.arange(5), np.zeros(0, np.int64)),
+             (np.zeros(0, np.int64), np.zeros(0, np.int64))]
+    for first, second in cases:
+        first, second = first.astype(np.int64), second.astype(np.int64)
+        union, first_at, second_at = grouped.merge_sorted(first, second)
+        want = np.union1d(first, second)
+        assert np.array_equal(union, want) and union.dtype == want.dtype
+        assert np.array_equal(first_at, np.searchsorted(want, first))
+        assert np.array_equal(second_at, np.searchsorted(want, second))

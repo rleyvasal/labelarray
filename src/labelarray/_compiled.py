@@ -99,3 +99,43 @@ def in_order(table: np.ndarray, mean: bool, na_rm: bool):
     and the order of the NumPy path, so the bits are the same.
     """
     return _in_order(table, mean, na_rm)
+
+
+@nb.njit(cache=True, nogil=True)
+def _merge_sorted(first, second):  # pragma: no cover - compiled
+    union = np.empty(len(first) + len(second), dtype=first.dtype)
+    first_at = np.empty(len(first), dtype=np.intp)
+    second_at = np.empty(len(second), dtype=np.intp)
+    i = j = k = 0
+    while i < len(first) and j < len(second):
+        if first[i] < second[j]:
+            union[k] = first[i]
+            first_at[i] = k
+            i += 1
+        elif second[j] < first[i]:
+            union[k] = second[j]
+            second_at[j] = k
+            j += 1
+        else:
+            union[k] = first[i]
+            first_at[i] = k
+            second_at[j] = k
+            i += 1
+            j += 1
+        k += 1
+    while i < len(first):
+        union[k] = first[i]
+        first_at[i] = k
+        i += 1
+        k += 1
+    while j < len(second):
+        union[k] = second[j]
+        second_at[j] = k
+        j += 1
+        k += 1
+    return union[:k], first_at, second_at
+
+
+def merge_sorted(first: np.ndarray, second: np.ndarray):
+    """Two sorted arrays of distinct keys merged in one pass: their union, and where each one's keys stand in it."""
+    return _merge_sorted(first, second)
