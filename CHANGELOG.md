@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.6 — 2026-10-28
+
+- `grouped.merge_sorted(first, second)`: two sorted arrays of distinct
+  keys as one, their union and where each one's keys stand in it, as
+  `np.union1d` and `np.searchsorted` give them, in one pass: a compiled
+  two-pointer merge with `labelarray[fast]`, which releases the GIL, so
+  callers' threads run it side by side, else a stable sort, which merges
+  the two runs it is given. On 500,000 and 400,000 keys, 2.6 ms compiled
+  and 6.8 ms on NumPy, against 100.5 ms. For keeping a table of groups as
+  blocks of data merge into it.
+- `sums.chunk_estimate` given a code per position and several values to
+  each (axes beyond the first) sums each position's values first, then the
+  positions per group, without repeating the position's code for each
+  value; the error bound counts the position's additions and the group's,
+  so the results stay correctly rounded.
+
 ## 0.1.5 — 2026-10-27
 
 - `quantile`: `Array.reduce("quantile", axes, q=...)` and
